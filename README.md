@@ -58,4 +58,6 @@ chmod +x install_spotify_roon_bridge.sh uninstall_spotify_roon_bridge.sh status.
 sudo ./install_spotify_roon_bridge.sh
 
 
-access to your stream at http://debianip:8000/spotify.aac
+access to your streamlist at http://debianip:8000
+
+Add desired stream to the "own webradio" of your streamer
