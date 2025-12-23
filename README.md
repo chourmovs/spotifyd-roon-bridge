@@ -56,3 +56,6 @@ Makers / IP radios / home automation integrators: need a stable HTTP stream cont
 ```bash
 chmod +x install_spotify_roon_bridge.sh uninstall_spotify_roon_bridge.sh status.sh
 sudo ./install_spotify_roon_bridge.sh
+
+
+access to your stream at http://debianip:8000/spotify.aac
