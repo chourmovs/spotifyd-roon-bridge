@@ -2,16 +2,21 @@
 set -euo pipefail
 
 # ============================================================
-# install_spotify_roon_bridge.sh  (v1.0-beta FROZEN)
+# install_spotify_roon_bridge.sh  (v1.0-beta FROZEN+)
 #
 # Spotifyd (Spotify Connect) -> ALSA Loopback -> Liquidsoap -> Icecast
 # Outputs:
-#   - /spotify.mp3  (MP3 320k)
-#   - /spotify.aac  (AAC 320k, ADTS via %ffmpeg)
+#   - /spotify.mp3          (MP3 320k)
+#   - /spotify.aac          (AAC 320k ADTS via %ffmpeg)
+#   - /spotify-lossless.ogg (Ogg/FLAC lossless stream-safe)   [NEW]
+#   - /spotify-raw.flac     (Raw FLAC native, experimental)   [NEW]
+#
+# Icecast:
+#   - limits/sources forced to 10  [NEW]
 #
 # Key design:
-# - spotifyd + liquidsoap run as SYSTEM services (no systemd --user, no DBus headaches)
-# - ALSA devices are FROZEN to the known-good mapping:
+# - spotifyd + liquidsoap run as SYSTEM services (no systemd --user)
+# - ALSA devices are FROZEN:
 #     spotifyd OUT : plughw:CARD=Loopback,DEV=0,SUBDEV=0
 #     liquidsoap IN: plughw:CARD=Loopback,DEV=1,SUBDEV=0
 # - icecast.xml patched safely with perl (no bash "$ENV" expansion bug)
@@ -21,12 +26,18 @@ set -euo pipefail
 # Env overrides (optional):
 #   RADIO_USER=radio
 #   ICECAST_PORT=8000
+#   ICECAST_SOURCES_LIMIT=10
+#
 #   ICECAST_MOUNT_MP3=/spotify.mp3
 #   ICECAST_MOUNT_AAC=/spotify.aac
+#   ICECAST_MOUNT_LOSSLESS_OGG=/spotify-lossless.ogg
+#   ICECAST_MOUNT_RAW_FLAC=/spotify-raw.flac
+#
 #   SPOTIFY_DEVICE_NAME="Roon-Spotify-Bridge"
 #   SPOTIFYD_VERSION=v0.4.2
 #   SPOTIFYD_FLAVOR=full
-#   CAPTURE_DRIVER=plughw|dsnoop         (default plughw)
+#   CAPTURE_DRIVER=plughw|dsnoop
+#
 #   ICECAST_SOURCE_PW=...
 #   ICECAST_ADMIN_PW=...
 #   ICECAST_ADMIN_USER=admin
@@ -38,8 +49,13 @@ set -euo pipefail
 RADIO_USER="${RADIO_USER:-radio}"
 
 ICECAST_PORT="${ICECAST_PORT:-8000}"
+ICECAST_SOURCES_LIMIT="${ICECAST_SOURCES_LIMIT:-10}"
+
 ICECAST_MOUNT_MP3="${ICECAST_MOUNT_MP3:-/spotify.mp3}"
 ICECAST_MOUNT_AAC="${ICECAST_MOUNT_AAC:-/spotify.aac}"
+ICECAST_MOUNT_LOSSLESS_OGG="${ICECAST_MOUNT_LOSSLESS_OGG:-/spotify-lossless.ogg}"
+ICECAST_MOUNT_RAW_FLAC="${ICECAST_MOUNT_RAW_FLAC:-/spotify-raw.flac}"
+
 ICECAST_ADMIN_USER="${ICECAST_ADMIN_USER:-admin}"
 
 SPOTIFY_DEVICE_NAME="${SPOTIFY_DEVICE_NAME:-Roon-Spotify-Bridge}"
@@ -130,7 +146,7 @@ resolve_spotifyd_url() {
     fi
   done
 
-  # Last resort: try GitHub API for exact asset naming
+  # Last resort: GitHub API for exact asset naming
   local tag api json found
   for tag in "v${v}" "${v}"; do
     api="https://api.github.com/repos/Spotifyd/spotifyd/releases/tags/${tag}"
@@ -190,7 +206,7 @@ install_spotifyd() {
   ok "spotifyd installed at /usr/local/bin/spotifyd"
 }
 
-# ---------- spotifyd.conf (minimal + stable)
+# ---------- spotifyd.conf
 configure_spotifyd_conf() {
   sec "Configure spotifyd.conf (ALSA loopback OUT frozen)"
   local cfg_dir="/home/${RADIO_USER}/.config/spotifyd"
@@ -263,7 +279,7 @@ patch_icecast_xml_debian_style() {
     ok "Backup created: ${f}.bak.spotify-roon-bridge"
   fi
 
-  export ICECAST_SOURCE_PW ICECAST_ADMIN_PW ICECAST_PORT
+  export ICECAST_SOURCE_PW ICECAST_ADMIN_PW ICECAST_PORT ICECAST_SOURCES_LIMIT
 
   # Update passwords
   perl -0777 -i -pe 's~(<source-password>).*?(</source-password>)~$1.$ENV{ICECAST_SOURCE_PW}.$2~seg' "$f"
@@ -271,6 +287,14 @@ patch_icecast_xml_debian_style() {
 
   # Ensure port within first listen-socket; handles empty <port></port>
   perl -0777 -i -pe 's~(<listen-socket>\s*.*?<port>)\s*[^<]*\s*(</port>)~$1.$ENV{ICECAST_PORT}.$2~seg' "$f"
+
+  # NEW: force limits/sources to allow multiple mounts (MP3+AACP+FLACx2 => 4 sources)
+  if grep -q "<sources>" "$f"; then
+    perl -0777 -i -pe 's~(<sources>)\s*\d+\s*(</sources>)~$1.$ENV{ICECAST_SOURCES_LIMIT}.$2~seg' "$f"
+    ok "icecast.xml: limits/sources -> ${ICECAST_SOURCES_LIMIT}"
+  else
+    warn "icecast.xml: <sources> not found; cannot auto-set sources limit"
+  fi
 
   grep -q "<paths>" "$f" || die "icecast.xml sanity check failed (<paths> missing)"
   grep -q "<security>" "$f" || die "icecast.xml sanity check failed (<security> missing)"
@@ -298,9 +322,9 @@ enable_icecast_debian() {
   ok "icecast2 listening on ${ICECAST_PORT}"
 }
 
-# ---------- Liquidsoap config (MP3 + AAC ADTS) - known good
+# ---------- Liquidsoap config
 configure_liquidsoap() {
-  sec "Configure Liquidsoap (MP3 + AAC ADTS)"
+  sec "Configure Liquidsoap (MP3 + AAC + LOSSLESS FLACx2)"
 
   local in_dev
   case "$CAPTURE_DRIVER" in
@@ -340,13 +364,33 @@ output.icecast(
   description="AAC 320k ADTS",
   src
 )
+
+# LOSSLESS (stream-safe): Ogg/FLAC
+# "gros bitrate" => compression=0 (moins compressé => débit plus élevé)
+output.icecast(
+  %ogg(%flac(samplerate=44100, channels=2, bits_per_sample=16, compression=0)),
+  host="127.0.0.1", port=${ICECAST_PORT}, password="${ICECAST_SOURCE_PW}",
+  mount="${ICECAST_MOUNT_LOSSLESS_OGG}",
+  name="Spotify (LOSSLESS Ogg/FLAC)",
+  description="Lossless stream-safe (Ogg/FLAC)",
+  src
+)
+
+# RAW FLAC (experimental): native FLAC
+# NOTE: clients connecting midstream may fail to decode.
+output.icecast(
+  %flac(samplerate=44100, channels=2, bits_per_sample=16, compression=0),
+  host="127.0.0.1", port=${ICECAST_PORT}, password="${ICECAST_SOURCE_PW}",
+  mount="${ICECAST_MOUNT_RAW_FLAC}",
+  name="Spotify (RAW FLAC)",
+  description="Native FLAC (experimental, not stream-safe)",
+  src
+)
 EOF
 
-  # perms: MUST be readable by User=radio service, avoid Permission denied
   chmod 0644 /etc/liquidsoap/spotify.liq
   chmod 0755 /etc/liquidsoap
 
-  # compatibility symlink if older unit points to spotify_icecast.liq
   ln -sf /etc/liquidsoap/spotify.liq /etc/liquidsoap/spotify_icecast.liq
 
   ok "Liquidsoap config written (/etc/liquidsoap/spotify.liq) [input=${in_dev}]"
@@ -373,7 +417,6 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-  # Preflight syntax check (prevents "mount absent" surprises)
   if ! /usr/bin/liquidsoap --check /etc/liquidsoap/spotify.liq; then
     die "Liquidsoap config check failed. Fix /etc/liquidsoap/spotify.liq then re-run."
   fi
@@ -389,7 +432,7 @@ EOF
   ok "liquidsoap-spotify active"
 }
 
-# ---------- ALSA loopback (best-effort, non-destructive)
+# ---------- ALSA loopback
 ensure_alsa_loopback() {
   sec "ALSA loopback (snd-aloop)"
   modprobe snd-aloop 2>/dev/null || true
@@ -405,28 +448,25 @@ smoke_tests() {
   [[ "$st" == "200" ]] || die "Icecast status page not reachable (HTTP $st)"
   ok "Icecast status OK (HTTP 200)"
 
-  # Validate mounts exist (auth)
   local mounts
   mounts="$(curl -fsS "http://127.0.0.1:${ICECAST_PORT}/admin/listmounts" \
             -u "${ICECAST_ADMIN_USER}:${ICECAST_ADMIN_PW}" || true)"
 
-  echo "$mounts" | grep -q "mount=\"${ICECAST_MOUNT_MP3}\"" || {
-    journalctl -u liquidsoap-spotify -n 200 --no-pager -l || true
-    die "MP3 mount not visible: ${ICECAST_MOUNT_MP3}"
-  }
-  ok "Mount visible: ${ICECAST_MOUNT_MP3}"
+  for m in "${ICECAST_MOUNT_MP3}" "${ICECAST_MOUNT_AAC}" "${ICECAST_MOUNT_LOSSLESS_OGG}" "${ICECAST_MOUNT_RAW_FLAC}"; do
+    echo "$mounts" | grep -q "mount=\"${m}\"" || {
+      journalctl -u liquidsoap-spotify -n 200 --no-pager -l || true
+      die "Mount not visible: ${m}"
+    }
+    ok "Mount visible: ${m}"
+  done
 
-  echo "$mounts" | grep -q "mount=\"${ICECAST_MOUNT_AAC}\"" || {
-    journalctl -u liquidsoap-spotify -n 200 --no-pager -l || true
-    die "AAC mount not visible: ${ICECAST_MOUNT_AAC}"
-  }
-  ok "Mount visible: ${ICECAST_MOUNT_AAC}"
-
-  # Quick HTTP GET checks (expect 200 once connected)
-  local mp3 aac
+  local mp3 aac ogg flac
   mp3="$(http_code_get "http://127.0.0.1:${ICECAST_PORT}${ICECAST_MOUNT_MP3}")"
   aac="$(http_code_get "http://127.0.0.1:${ICECAST_PORT}${ICECAST_MOUNT_AAC}")"
-  echo "MP3 HTTP=${mp3}  AAC HTTP=${aac}"
+  ogg="$(http_code_get "http://127.0.0.1:${ICECAST_PORT}${ICECAST_MOUNT_LOSSLESS_OGG}")"
+  flac="$(http_code_get "http://127.0.0.1:${ICECAST_PORT}${ICECAST_MOUNT_RAW_FLAC}")"
+  echo "MP3 HTTP=${mp3}  AAC HTTP=${aac}  OGG/FLAC HTTP=${ogg}  RAW FLAC HTTP=${flac}"
+
   ok "Smoke tests done"
 }
 
@@ -465,8 +505,10 @@ main() {
   sec "DONE"
   local ip
   ip="$(hostname -I | awk '{print $1}')"
-  echo "MP3: http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_MP3}"
-  echo "AAC: http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_AAC}"
+  echo "MP3:          http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_MP3}"
+  echo "AAC:          http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_AAC}"
+  echo "LOSSLESS:     http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_LOSSLESS_OGG}"
+  echo "RAW FLAC:     http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_RAW_FLAC}"
   echo "Services:"
   echo "  systemctl status spotifyd icecast2 liquidsoap-spotify --no-pager"
 }
