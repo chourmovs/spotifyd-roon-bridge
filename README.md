@@ -59,4 +59,4 @@ sudo ./install_spotify_roon_bridge.sh
 
 access to your streamlist at http://debianip:8000
 
-Add desired stream to the "own webradio" of your streamer
+Add desired stream into the "own webradio" section of your streamer.
