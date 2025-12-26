@@ -1,39 +1,60 @@
 #!/usr/bin/env bash
 set -euo pipefail
+IFS=$'\n\t'
 
-die(){ echo "✖ $*" >&2; exit 1; }
-ok(){  echo "✔ $*"; }
-require_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root: sudo $0"; }
+log()  { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+err()  { echo "[ERR]  $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+SERVICE_USER="${SERVICE_USER:-radio}"
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "Lance ce script en root (sudo -i)."
+  fi
+}
+
+run_as_user() {
+  local u="$1"; shift
+  local uid
+  uid="$(id -u "$u" 2>/dev/null || true)"
+  [[ -n "$uid" ]] || return 0
+  runuser -u "$u" -- bash -lc "
+    export XDG_RUNTIME_DIR=/run/user/$uid
+    export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus
+    $*
+  "
+}
 
 main() {
   require_root
 
-  read -rp "Remove bridge services/configs (keep packages). Continue? [y/N] " yn
-  [[ "${yn:-n}" =~ ^[yY]$ ]] || exit 0
-
-  systemctl disable --now liquidsoap-spotify 2>/dev/null || true
-  rm -f /etc/systemd/system/liquidsoap-spotify.service
-  rm -f /etc/liquidsoap/spotify.liq /etc/liquidsoap/spotify_icecast.liq
-  ok "Liquidsoap bridge removed"
-
-  systemctl disable --now spotifyd 2>/dev/null || true
-  rm -f /etc/systemd/system/spotifyd.service
-  ok "spotifyd system service removed (binary kept: /usr/local/bin/spotifyd)"
-
+  log "Stop/disable system unit Liquidsoap..."
+  systemctl disable --now spotify-roon-liquidsoap.service 2>/dev/null || true
+  systemctl reset-failed spotify-roon-liquidsoap.service 2>/dev/null || true
+  rm -f /etc/systemd/system/spotify-roon-liquidsoap.service || true
   systemctl daemon-reload || true
 
-  if [[ -f /etc/icecast2/icecast.xml.bak.spotify-roon-bridge ]]; then
-    cp -a /etc/icecast2/icecast.xml.bak.spotify-roon-bridge /etc/icecast2/icecast.xml
-    systemctl restart icecast2 2>/dev/null || true
-    ok "icecast.xml restored from backup"
-  else
-    ok "No icecast.xml backup found"
+  if id "$SERVICE_USER" >/dev/null 2>&1; then
+    log "Stop/disable user unit Pulse bridge..."
+    run_as_user "$SERVICE_USER" "systemctl --user disable --now spotify-roon-pulse-bridge.service 2>/dev/null || true" || true
+    run_as_user "$SERVICE_USER" "systemctl --user daemon-reload" || true
+
+    local h
+    h="$(getent passwd "$SERVICE_USER" | awk -F: '{print $6}')"
+    rm -f "$h/.config/systemd/user/spotify-roon-pulse-bridge.service" || true
   fi
 
-  echo ""
-  echo "Uninstall done."
-  echo "Optional purge packages:"
-  echo "  apt-get purge icecast2 liquidsoap avahi-daemon alsa-utils"
+  log "Remove bridge binary..."
+  rm -f /usr/local/bin/spotify-roon-pulse-bridge || true
+
+  log "Remove configs/logs..."
+  rm -rf /etc/spotify-roon-bridge || true
+  rm -rf /var/log/spotify-roon-bridge || true
+
+  log "Note: on ne purge pas icecast2/liquidsoap/pipewire par défaut."
+  log "Terminé."
 }
 
 main "$@"

@@ -1,516 +1,438 @@
 #!/usr/bin/env bash
 set -euo pipefail
+IFS=$'\n\t'
 
-# ============================================================
-# install_spotify_roon_bridge.sh  (v1.0-beta FROZEN+)
-#
-# Spotifyd (Spotify Connect) -> ALSA Loopback -> Liquidsoap -> Icecast
-# Outputs:
-#   - /spotify.mp3          (MP3 320k)
-#   - /spotify.aac          (AAC 320k ADTS via %ffmpeg)
-#   - /spotify-lossless.ogg (Ogg/FLAC lossless stream-safe)   [NEW]
-#   - /spotify-raw.flac     (Raw FLAC native, experimental)   [NEW]
-#
-# Icecast:
-#   - limits/sources forced to 10  [NEW]
-#
-# Key design:
-# - spotifyd + liquidsoap run as SYSTEM services (no systemd --user)
-# - ALSA devices are FROZEN:
-#     spotifyd OUT : plughw:CARD=Loopback,DEV=0,SUBDEV=0
-#     liquidsoap IN: plughw:CARD=Loopback,DEV=1,SUBDEV=0
-# - icecast.xml patched safely with perl (no bash "$ENV" expansion bug)
-# - /etc/liquidsoap perms forced to avoid Permission denied
-# - Validation uses Icecast /admin/listmounts (auth) + HTTP GET
-#
-# Env overrides (optional):
-#   RADIO_USER=radio
-#   ICECAST_PORT=8000
-#   ICECAST_SOURCES_LIMIT=10
-#
-#   ICECAST_MOUNT_MP3=/spotify.mp3
-#   ICECAST_MOUNT_AAC=/spotify.aac
-#   ICECAST_MOUNT_LOSSLESS_OGG=/spotify-lossless.ogg
-#   ICECAST_MOUNT_RAW_FLAC=/spotify-raw.flac
-#
-#   SPOTIFY_DEVICE_NAME="Roon-Spotify-Bridge"
-#   SPOTIFYD_VERSION=v0.4.2
-#   SPOTIFYD_FLAVOR=full
-#   CAPTURE_DRIVER=plughw|dsnoop
-#
-#   ICECAST_SOURCE_PW=...
-#   ICECAST_ADMIN_PW=...
-#   ICECAST_ADMIN_USER=admin
-#
-# Run:
-#   sudo ./install_spotify_roon_bridge.sh
-# ============================================================
+# Spotify (user session radio) -> PipeWire/Pulse null sink -> loopback vers ALSA Loopback -> Liquidsoap -> Icecast
+# Debian 13 / Proxmox VM
 
-RADIO_USER="${RADIO_USER:-radio}"
+########################################
+# Defaults
+########################################
+SERVICE_USER="${SERVICE_USER:-radio}"
 
 ICECAST_PORT="${ICECAST_PORT:-8000}"
-ICECAST_SOURCES_LIMIT="${ICECAST_SOURCES_LIMIT:-10}"
+ICECAST_HOST="${ICECAST_HOST:-127.0.0.1}"
 
-ICECAST_MOUNT_MP3="${ICECAST_MOUNT_MP3:-/spotify.mp3}"
-ICECAST_MOUNT_AAC="${ICECAST_MOUNT_AAC:-/spotify.aac}"
-ICECAST_MOUNT_LOSSLESS_OGG="${ICECAST_MOUNT_LOSSLESS_OGG:-/spotify-lossless.ogg}"
-ICECAST_MOUNT_RAW_FLAC="${ICECAST_MOUNT_RAW_FLAC:-/spotify-raw.flac}"
+MOUNT_MP3="${MOUNT_MP3:-/spotify.mp3}"
+MOUNT_AAC="${MOUNT_AAC:-/spotify.aac}"
+MOUNT_FLAC="${MOUNT_FLAC:-/spotify.flac}"
 
-ICECAST_ADMIN_USER="${ICECAST_ADMIN_USER:-admin}"
+ICECAST_SOURCE_PASSWORD="${ICECAST_SOURCE_PASSWORD:-hackme}"
+ICECAST_ADMIN_PASSWORD="${ICECAST_ADMIN_PASSWORD:-hackme}"
 
-SPOTIFY_DEVICE_NAME="${SPOTIFY_DEVICE_NAME:-Roon-Spotify-Bridge}"
-SPOTIFYD_VERSION="${SPOTIFYD_VERSION:-v0.4.2}"
-SPOTIFYD_FLAVOR="${SPOTIFYD_FLAVOR:-full}"
+# Pulse side
+SINK_NAME="${SINK_NAME:-loopback}"
+PULSE_TARGET_SINK="${PULSE_TARGET_SINK:-loopback}"
 
-CAPTURE_DRIVER="${CAPTURE_DRIVER:-plughw}" # plughw or dsnoop
+# ALSA loopback capture device for Liquidsoap
+ALSA_CAPTURE_DEVICE="${ALSA_CAPTURE_DEVICE:-hw:Loopback,1,0}"
 
-SPOTIFYD_ALSA_OUT="plughw:CARD=Loopback,DEV=0,SUBDEV=0"
-LOOPBACK_CAPTURE_BASE="CARD=Loopback,DEV=1,SUBDEV=0"
+# Encoding defaults
+MP3_BITRATE="${MP3_BITRATE:-320}"
+AAC_BITRATE="${AAC_BITRATE:-320k}"
+FLAC_BITS="${FLAC_BITS:-16}"
+FLAC_SR="${FLAC_SR:-44100}"
 
-die(){ echo "✖ $*" >&2; exit 1; }
-ok(){  echo "✔ $*"; }
-warn(){ echo "⚠ $*" >&2; }
-sec(){ echo -e "\n== $* ==\n"; }
+# Logging
+LOG_GROUP="${LOG_GROUP:-spotify-roon-bridge}"
+LOG_DIR="${LOG_DIR:-/var/log/spotify-roon-bridge}"
+LOG_FILE="${LOG_FILE:-/var/log/spotify-roon-bridge/liquidsoap.log}"
 
-require_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root: sudo $0"; }
-have(){ command -v "$1" >/dev/null 2>&1; }
+########################################
+# Helpers
+########################################
+log()  { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+err()  { echo "[ERR]  $*" >&2; }
+die()  { err "$*"; exit 1; }
 
-read_secret_if_empty() {
-  local var="$1" prompt="$2"
-  local val="${!var:-}"
-  if [[ -z "$val" ]]; then
-    read -rsp "${prompt}: " val; echo ""
-    [[ -n "$val" ]] || die "Empty secret: $var"
-    export "$var"="$val"
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "Lance ce script en root (sudo -i)."
   fi
 }
 
-detect_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64) echo "x86_64" ;;
-    aarch64|arm64) echo "aarch64" ;;
-    armv7l) echo "armv7" ;;
-    *) die "Unsupported arch: $(uname -m)" ;;
-  esac
+user_home() {
+  local u="$1"
+  getent passwd "$u" | awk -F: '{print $6}'
 }
 
-backup_file() {
-  local f="$1"
-  [[ -f "$f" ]] || return 0
-  local ts; ts="$(date +%Y%m%d-%H%M%S)"
-  cp -a "$f" "${f}.bak.${ts}"
-  ok "Backup: ${f}.bak.${ts}"
+run_as_user() {
+  local u="$1"; shift
+  local uid
+  uid="$(id -u "$u")"
+  runuser -u "$u" -- bash -lc "
+    export XDG_RUNTIME_DIR=/run/user/$uid
+    export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus
+    $*
+  "
 }
 
-wait_listen() {
-  local port="$1" tries="${2:-80}" delay="${3:-0.2}"
-  for _ in $(seq 1 "$tries"); do
-    if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "(:|\\])${port}\$"; then
-      return 0
-    fi
-    sleep "$delay"
-  done
-  return 1
+xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  s="${s//\"/&quot;}"
+  s="${s//\'/&apos;}"
+  printf '%s' "$s"
 }
 
-http_code_get() {
-  curl -sS -o /dev/null -w "%{http_code}" "$1" 2>/dev/null || echo "000"
+mount_norm() {
+  # Liquidsoap mount="foo.mp3" => Icecast URL /foo.mp3
+  local m="$1"
+  m="${m#/}"
+  printf '%s' "$m"
 }
 
-ensure_user() {
-  if ! id -u "$RADIO_USER" >/dev/null 2>&1; then
-    adduser --disabled-password --gecos "" "$RADIO_USER"
-    ok "User created: ${RADIO_USER}"
-  fi
-  usermod -aG audio "$RADIO_USER" || true
-  ok "User '${RADIO_USER}' in group audio (best effort)"
+########################################
+# Packages
+########################################
+install_packages() {
+  log "Installation paquets..."
+  apt-get update -y
+  apt-get install -y \
+    ca-certificates curl gnupg lsb-release \
+    icecast2 liquidsoap ffmpeg \
+    pipewire pipewire-pulse wireplumber \
+    pulseaudio-utils alsa-utils
+
+  # Optionnel
+  apt-get install -y spotify-client || warn "spotify-client non installé (skip)."
 }
 
-# ---------- spotifyd download (robust URL resolution + fallbacks)
-resolve_spotifyd_url() {
-  local arch flavor v base asset url
-  arch="$(detect_arch)"
-  flavor="$SPOTIFYD_FLAVOR"
-  v="${SPOTIFYD_VERSION#v}"
-  base="https://github.com/Spotifyd/spotifyd/releases/download/v${v}"
+########################################
+# Users/groups/perms
+########################################
+ensure_groups_and_perms() {
+  log "Préparation groupes & permissions..."
 
-  for asset in \
-    "spotifyd-linux-${arch}-${flavor}.tar.gz" \
-    "spotifyd-linux-${arch}-full.tar.gz" \
-    "spotifyd-linux-${arch}-default.tar.gz" \
-    "spotifyd-linux-${arch}-slim.tar.gz"
-  do
-    url="${base}/${asset}"
-    if curl -fsI "$url" >/dev/null 2>&1; then
-      echo "$url"; return 0
-    fi
-  done
+  # Log group
+  groupadd -f "$LOG_GROUP"
 
-  # Last resort: GitHub API for exact asset naming
-  local tag api json found
-  for tag in "v${v}" "${v}"; do
-    api="https://api.github.com/repos/Spotifyd/spotifyd/releases/tags/${tag}"
-    if json="$(curl -fsSL "$api" 2>/dev/null)"; then
-      found="$(
-        python3 -c '
-import json, sys
-arch=sys.argv[1]
-flavor=sys.argv[2]
-data=json.load(sys.stdin)
-assets=data.get("assets") or []
-cand=[]
-exact=f"spotifyd-linux-{arch}-{flavor}.tar.gz".lower()
-for a in assets:
-    n=(a.get("name") or "")
-    u=(a.get("browser_download_url") or "")
-    if not (n and u and n.lower().endswith(".tar.gz")):
-        continue
-    ln=n.lower()
-    s=0
-    if "linux" in ln: s+=50
-    if arch in ln: s+=50
-    if flavor and flavor.lower() in ln: s+=40
-    if ln == exact: s+=200
-    cand.append((s,u,n))
-cand.sort(reverse=True, key=lambda x:x[0])
-print(cand[0][1] if cand and cand[0][0] >= 100 else "", end="")
-' "$arch" "$flavor" <<<"$json" 2>/dev/null || true
-      )"
-      if [[ -n "${found:-}" ]]; then
-        echo "$found"; return 0
-      fi
-    fi
-  done
+  # Ensure user exists
+  id "$SERVICE_USER" >/dev/null 2>&1 || die "User '$SERVICE_USER' introuvable."
 
-  return 1
+  # Audio + log group
+  usermod -aG audio "$SERVICE_USER" || true
+  usermod -aG "$LOG_GROUP" "$SERVICE_USER" || true
+
+  # Log directory must be writable by SERVICE_USER (via group)
+  install -d -m 2775 -o root -g "$LOG_GROUP" "$LOG_DIR"
+  touch "$LOG_FILE"
+  chown "$SERVICE_USER":"$LOG_GROUP" "$LOG_FILE"
+  chmod 0664 "$LOG_FILE"
 }
 
-install_spotifyd() {
-  sec "Install spotifyd binary"
-  local url tmp
-  tmp="/tmp/spotifyd_dl"
-  rm -rf "$tmp"; mkdir -p "$tmp"
-
-  url="$(resolve_spotifyd_url)" || die "Could not resolve spotifyd asset URL."
-  echo "Resolved asset: $url"
-
-  curl -fL --retry 6 --retry-delay 1 --connect-timeout 10 \
-    -o "$tmp/spotifyd.tgz" "$url" || die "Download failed: $url"
-
-  tar -xzf "$tmp/spotifyd.tgz" -C "$tmp"
-  local bin
-  bin="$(find "$tmp" -maxdepth 3 -type f -name spotifyd | head -n 1 || true)"
-  [[ -n "${bin:-}" && -f "$bin" ]] || die "spotifyd binary missing after extract"
-
-  install -m 0755 "$bin" /usr/local/bin/spotifyd
-  ok "spotifyd installed at /usr/local/bin/spotifyd"
-}
-
-# ---------- spotifyd.conf
-configure_spotifyd_conf() {
-  sec "Configure spotifyd.conf (ALSA loopback OUT frozen)"
-  local cfg_dir="/home/${RADIO_USER}/.config/spotifyd"
-  local cfg="${cfg_dir}/spotifyd.conf"
-
-  install -d -m 0755 -o "$RADIO_USER" -g "$RADIO_USER" "$cfg_dir"
-  install -d -m 0755 -o "$RADIO_USER" -g "$RADIO_USER" "/home/${RADIO_USER}/.cache/spotifyd"
-
-  backup_file "$cfg"
-
-  cat >"$cfg" <<EOF
-[global]
-device_name = "${SPOTIFY_DEVICE_NAME}"
-use_mpris = false
-
-backend = "alsa"
-device = "${SPOTIFYD_ALSA_OUT}"
-
-audio_format = "S16"
-bitrate = 320
-
-cache_path = "/home/${RADIO_USER}/.cache/spotifyd"
-volume_controller = "softvol"
-initial_volume = 90
+########################################
+# ALSA loopback
+########################################
+enable_snd_aloop() {
+  log "Activation ALSA loopback (snd-aloop)..."
+  cat >/etc/modules-load.d/snd-aloop.conf <<'EOF'
+# spotify-roon-bridge
+snd-aloop
 EOF
 
-  chown "$RADIO_USER:$RADIO_USER" "$cfg"
-  chmod 600 "$cfg"
-  ok "spotifyd.conf written"
-}
-
-install_spotifyd_system_service() {
-  sec "Install spotifyd systemd service"
-  cat >/etc/systemd/system/spotifyd.service <<EOF
-[Unit]
-Description=spotifyd (Spotify Connect daemon)
-After=network-online.target sound.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${RADIO_USER}
-Group=audio
-SupplementaryGroups=audio
-Environment=HOME=/home/${RADIO_USER}
-WorkingDirectory=/home/${RADIO_USER}
-ExecStart=/usr/local/bin/spotifyd --no-daemon --config-path /home/${RADIO_USER}/.config/spotifyd/spotifyd.conf
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
+  cat >/etc/modprobe.d/snd-aloop.conf <<'EOF'
+# spotify-roon-bridge
+options snd-aloop pcm_substreams=2
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now spotifyd
-  systemctl restart spotifyd
-  systemctl is-active --quiet spotifyd || { systemctl status spotifyd --no-pager -l; die "spotifyd not active"; }
-  ok "spotifyd active (system)"
+  modprobe snd_aloop || true
 }
 
-# ---------- Icecast patch (safe; no bash $ENV bug)
-patch_icecast_xml_debian_style() {
-  sec "Patch Icecast config (safe in-place)"
-  local f="/etc/icecast2/icecast.xml"
-  [[ -f "$f" ]] || die "Missing $f (icecast2 not installed?)"
+########################################
+# Icecast
+########################################
+configure_icecast() {
+  log "Configuration Icecast..."
 
-  if [[ ! -f "${f}.bak.spotify-roon-bridge" ]]; then
-    cp -a "$f" "${f}.bak.spotify-roon-bridge"
-    ok "Backup created: ${f}.bak.spotify-roon-bridge"
+  if [[ -f /etc/icecast2/icecast.xml ]]; then
+    cp -a /etc/icecast2/icecast.xml "/etc/icecast2/icecast.xml.bak.$(date +%Y%m%d%H%M%S)" || true
   fi
 
-  export ICECAST_SOURCE_PW ICECAST_ADMIN_PW ICECAST_PORT ICECAST_SOURCES_LIMIT
+  local src_xml adm_xml host_xml
+  src_xml="$(xml_escape "$ICECAST_SOURCE_PASSWORD")"
+  adm_xml="$(xml_escape "$ICECAST_ADMIN_PASSWORD")"
+  host_xml="$(xml_escape "$ICECAST_HOST")"
 
-  # Update passwords
-  perl -0777 -i -pe 's~(<source-password>).*?(</source-password>)~$1.$ENV{ICECAST_SOURCE_PW}.$2~seg' "$f"
-  perl -0777 -i -pe 's~(<admin-password>).*?(</admin-password>)~$1.$ENV{ICECAST_ADMIN_PW}.$2~seg' "$f"
+  cat >/etc/icecast2/icecast.xml <<EOF
+<icecast>
+  <location>Home</location>
+  <admin>root@localhost</admin>
 
-  # Ensure port within first listen-socket; handles empty <port></port>
-  perl -0777 -i -pe 's~(<listen-socket>\s*.*?<port>)\s*[^<]*\s*(</port>)~$1.$ENV{ICECAST_PORT}.$2~seg' "$f"
+  <limits>
+    <clients>100</clients>
+    <sources>10</sources>
+    <queue-size>524288</queue-size>
+    <client-timeout>30</client-timeout>
+    <header-timeout>15</header-timeout>
+    <source-timeout>10</source-timeout>
+    <burst-on-connect>1</burst-on-connect>
+    <burst-size>65535</burst-size>
+  </limits>
 
-  # NEW: force limits/sources to allow multiple mounts (MP3+AACP+FLACx2 => 4 sources)
-  if grep -q "<sources>" "$f"; then
-    perl -0777 -i -pe 's~(<sources>)\s*\d+\s*(</sources>)~$1.$ENV{ICECAST_SOURCES_LIMIT}.$2~seg' "$f"
-    ok "icecast.xml: limits/sources -> ${ICECAST_SOURCES_LIMIT}"
-  else
-    warn "icecast.xml: <sources> not found; cannot auto-set sources limit"
-  fi
+  <authentication>
+    <source-password>${src_xml}</source-password>
+    <relay-password>${src_xml}</relay-password>
+    <admin-user>admin</admin-user>
+    <admin-password>${adm_xml}</admin-password>
+  </authentication>
 
-  grep -q "<paths>" "$f" || die "icecast.xml sanity check failed (<paths> missing)"
-  grep -q "<security>" "$f" || die "icecast.xml sanity check failed (<security> missing)"
-  ok "icecast.xml patched"
-}
+  <hostname>${host_xml}</hostname>
 
-enable_icecast_debian() {
-  sec "Enable Icecast on Debian"
-  if [[ -f /etc/default/icecast2 ]]; then
-    if grep -q '^ENABLE=' /etc/default/icecast2; then
-      sed -i 's/^ENABLE=.*/ENABLE=true/' /etc/default/icecast2 || true
-    else
-      echo 'ENABLE=true' >> /etc/default/icecast2
-    fi
-  fi
+  <listen-socket>
+    <port>${ICECAST_PORT}</port>
+    <bind-address>0.0.0.0</bind-address>
+  </listen-socket>
+
+  <fileserve>1</fileserve>
+
+  <paths>
+    <basedir>/usr/share/icecast2</basedir>
+    <logdir>/var/log/icecast2</logdir>
+    <webroot>/usr/share/icecast2/web</webroot>
+    <adminroot>/usr/share/icecast2/admin</adminroot>
+    <alias source="/" dest="/status.xsl"/>
+  </paths>
+
+  <logging>
+    <accesslog>access.log</accesslog>
+    <errorlog>error.log</errorlog>
+    <loglevel>3</loglevel>
+    <logsize>10000</logsize>
+  </logging>
+
+  <security>
+    <chroot>0</chroot>
+  </security>
+</icecast>
+EOF
 
   systemctl enable --now icecast2
   systemctl restart icecast2
-  systemctl is-active --quiet icecast2 || { systemctl status icecast2 --no-pager -l; die "icecast2 not active"; }
-  wait_listen "$ICECAST_PORT" || {
-    ss -lntp || true
-    journalctl -u icecast2 -n 200 --no-pager -l || true
-    die "icecast2 not listening on ${ICECAST_PORT}"
-  }
-  ok "icecast2 listening on ${ICECAST_PORT}"
 }
 
-# ---------- Liquidsoap config
+########################################
+# Pulse bridge (user) : null sink + loopback to ALSA Loopback playback
+########################################
+install_pulse_bridge() {
+  log "Installation Pulse bridge: /usr/local/bin/spotify-roon-pulse-bridge"
+
+  cat >/usr/local/bin/spotify-roon-pulse-bridge <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+SINK_NAME="${SINK_NAME:-loopback}"
+TARGET_SINK="${PULSE_TARGET_SINK:-loopback}"
+
+log() { echo "[bridge] $*"; }
+
+ensure_modules() {
+  # null sink for capture
+  if ! pactl list short sinks | awk '{print $2}' | grep -qx "$SINK_NAME"; then
+    log "Creating null sink: $SINK_NAME"
+    pactl load-module module-null-sink "sink_name=$SINK_NAME sink_properties=device.description=$SINK_NAME" >/dev/null || true
+  fi
+
+  # ALSA sink to Loopback playback
+  if ! pactl list short sinks | awk '{print $2}' | grep -q '^alsa_loopback$'; then
+    log "Creating ALSA sink: alsa_loopback (hw:Loopback,0,0)"
+    pactl load-module module-alsa-sink "sink_name=alsa_loopback device=hw:Loopback,0,0" >/dev/null || true
+  fi
+
+  # loopback from capture monitor to alsa sink
+  local mon="${SINK_NAME}.monitor"
+  if ! pactl list short modules | grep -q "module-loopback.*source=${mon}.*sink=alsa_loopback"; then
+    log "Creating loopback: ${mon} -> alsa_loopback"
+    pactl load-module module-loopback "source=${mon} sink=alsa_loopback latency_msec=50" >/dev/null || true
+  fi
+
+  pactl set-default-sink "$TARGET_SINK" >/dev/null 2>&1 || pactl set-default-sink "$SINK_NAME" >/dev/null 2>&1 || true
+  log "Default sink set to: $(pactl get-default-sink 2>/dev/null || true)"
+}
+
+cmd="${1:-start}"
+case "$cmd" in
+  start) ensure_modules ;;
+  stop)  log "Stop: non destructif (modules laissés en place)." ;;
+  *) echo "Usage: $0 {start|stop}" >&2; exit 2 ;;
+esac
+EOF
+
+  chmod 0755 /usr/local/bin/spotify-roon-pulse-bridge
+
+  local h
+  h="$(user_home "$SERVICE_USER")"
+  install -d -m 0755 "$h/.config/systemd/user"
+
+  cat >"$h/.config/systemd/user/spotify-roon-pulse-bridge.service" <<EOF
+[Unit]
+Description=Spotify Roon Bridge (Pulse bridge: null sink + loopback -> ALSA)
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=SINK_NAME=${SINK_NAME}
+Environment=PULSE_TARGET_SINK=${PULSE_TARGET_SINK}
+ExecStart=/usr/local/bin/spotify-roon-pulse-bridge start
+ExecStop=/usr/local/bin/spotify-roon-pulse-bridge stop
+
+[Install]
+WantedBy=default.target
+EOF
+
+  chown -R "${SERVICE_USER}:${SERVICE_USER}" "$h/.config/systemd/user"
+
+  run_as_user "$SERVICE_USER" "
+    systemctl --user daemon-reload
+    systemctl --user enable --now spotify-roon-pulse-bridge.service
+  "
+}
+
+########################################
+# Liquidsoap
+########################################
 configure_liquidsoap() {
-  sec "Configure Liquidsoap (MP3 + AAC + LOSSLESS FLACx2)"
+  log "Configuration Liquidsoap..."
+  install -d -m 0755 /etc/spotify-roon-bridge
 
-  local in_dev
-  case "$CAPTURE_DRIVER" in
-    plughw) in_dev="plughw:${LOOPBACK_CAPTURE_BASE}" ;;
-    dsnoop) in_dev="dsnoop:${LOOPBACK_CAPTURE_BASE}" ;;
-    *) die "CAPTURE_DRIVER must be plughw or dsnoop (got: $CAPTURE_DRIVER)" ;;
-  esac
+  local liq="/etc/spotify-roon-bridge/spotify-bridge.liq"
 
-  install -d -m 0755 /etc/liquidsoap
-  backup_file /etc/liquidsoap/spotify.liq
+  local mp3_mount aac_mount flac_mount
+  mp3_mount="$(mount_norm "$MOUNT_MP3")"
+  aac_mount="$(mount_norm "$MOUNT_AAC")"
+  flac_mount="$(mount_norm "$MOUNT_FLAC")"
 
-  cat >/etc/liquidsoap/spotify.liq <<EOF
-set("log.stdout", true)
-set("server.telnet", false)
+  cat >"$liq" <<EOF
+#!/usr/bin/liquidsoap
 
-s = input.alsa(id="spotify_capture", device="${in_dev}")
-src = mksafe(s)
+# Logging (Liquidsoap 2.3.x)
+settings.log.file.path := "${LOG_FILE}"
+settings.log.stdout := true
+settings.log.level := 3
 
-# MP3 (web-friendly)
+# ALSA capture (Loopback, capture side)
+s = input.alsa(id="spotify_capture", device="${ALSA_CAPTURE_DEVICE}")
+
+# Buffer anti-jitter
+s = buffer(s, buffer=2.0, max=10.0)
+
+# Always-on stream
+src = fallback(track_sensitive=false, [mksafe(s), blank()])
+
+# MP3
 output.icecast(
-  %mp3(bitrate=320, samplerate=44100, stereo=true),
-  host="127.0.0.1", port=${ICECAST_PORT}, password="${ICECAST_SOURCE_PW}",
-  mount="${ICECAST_MOUNT_MP3}",
-  name="Spotify (WEB MP3)",
-  description="Browser-friendly MP3",
+  %mp3(bitrate=${MP3_BITRATE}, stereo=true),
+  host="${ICECAST_HOST}", port=${ICECAST_PORT}, password="${ICECAST_SOURCE_PASSWORD}",
+  mount="${mp3_mount}",
+  name="Spotify (MP3 ${MP3_BITRATE})",
+  description="Spotify -> Icecast (MP3)",
   src
 )
 
-# AAC (ADTS) - known working on your box
+# AAC (ADTS via ffmpeg)
 output.icecast(
-  %ffmpeg(format="adts",
-    %audio(codec="aac", samplerate=44100, channels=2, b="320k")
+  %ffmpeg(
+    format="adts",
+    %audio(codec="aac", b="${AAC_BITRATE}", samplerate=${FLAC_SR}, channels=2)
   ),
-  host="127.0.0.1", port=${ICECAST_PORT}, password="${ICECAST_SOURCE_PW}",
-  mount="${ICECAST_MOUNT_AAC}",
-  name="Spotify (WEB AAC)",
-  description="AAC 320k ADTS",
+  host="${ICECAST_HOST}", port=${ICECAST_PORT}, password="${ICECAST_SOURCE_PASSWORD}",
+  mount="${aac_mount}",
+  name="Spotify (AAC ${AAC_BITRATE})",
+  description="Spotify -> Icecast (AAC)",
   src
 )
 
-# LOSSLESS (stream-safe): Ogg/FLAC
-# "gros bitrate" => compression=0 (moins compressé => débit plus élevé)
+# FLAC
 output.icecast(
-  %ogg(%flac(samplerate=44100, channels=2, bits_per_sample=16, compression=0)),
-  host="127.0.0.1", port=${ICECAST_PORT}, password="${ICECAST_SOURCE_PW}",
-  mount="${ICECAST_MOUNT_LOSSLESS_OGG}",
-  name="Spotify (LOSSLESS Ogg/FLAC)",
-  description="Lossless stream-safe (Ogg/FLAC)",
-  src
-)
-
-# RAW FLAC (experimental): native FLAC
-# NOTE: clients connecting midstream may fail to decode.
-output.icecast(
-  %flac(samplerate=44100, channels=2, bits_per_sample=16, compression=0),
-  host="127.0.0.1", port=${ICECAST_PORT}, password="${ICECAST_SOURCE_PW}",
-  mount="${ICECAST_MOUNT_RAW_FLAC}",
-  name="Spotify (RAW FLAC)",
-  description="Native FLAC (experimental, not stream-safe)",
+  %flac(samplerate=${FLAC_SR}, channels=2, bits_per_sample=${FLAC_BITS}),
+  host="${ICECAST_HOST}", port=${ICECAST_PORT}, password="${ICECAST_SOURCE_PASSWORD}",
+  mount="${flac_mount}",
+  name="Spotify (FLAC ${FLAC_BITS}b/${FLAC_SR}Hz)",
+  description="Spotify -> Icecast (FLAC)",
   src
 )
 EOF
 
-  chmod 0644 /etc/liquidsoap/spotify.liq
-  chmod 0755 /etc/liquidsoap
+  chmod 0644 "$liq"
+  chown root:root "$liq"
 
-  ln -sf /etc/liquidsoap/spotify.liq /etc/liquidsoap/spotify_icecast.liq
-
-  ok "Liquidsoap config written (/etc/liquidsoap/spotify.liq) [input=${in_dev}]"
+  log "Validation liquidsoap --check (user=${SERVICE_USER})..."
+  run_as_user "$SERVICE_USER" "liquidsoap --check /etc/spotify-roon-bridge/spotify-bridge.liq"
 }
 
-install_liquidsoap_service() {
-  sec "Install liquidsoap-spotify systemd service"
-  cat >/etc/systemd/system/liquidsoap-spotify.service <<EOF
+install_system_unit_liquidsoap() {
+  log "Installation unit systemd (liquidsoap -> icecast)..."
+
+  cat >/etc/systemd/system/spotify-roon-liquidsoap.service <<EOF
 [Unit]
-Description=Liquidsoap Spotify -> Icecast bridge
-After=network-online.target icecast2.service spotifyd.service
-Wants=network-online.target icecast2.service spotifyd.service
+Description=Spotify Roon Bridge (Liquidsoap -> Icecast)
+After=network.target sound.target icecast2.service
+Wants=icecast2.service
 
 [Service]
 Type=simple
-User=${RADIO_USER}
-Group=audio
+User=${SERVICE_USER}
+Group=${LOG_GROUP}
 SupplementaryGroups=audio
-ExecStart=/usr/bin/liquidsoap /etc/liquidsoap/spotify.liq
+ExecStart=/usr/bin/liquidsoap /etc/spotify-roon-bridge/spotify-bridge.liq
 Restart=always
 RestartSec=2
+UMask=002
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  if ! /usr/bin/liquidsoap --check /etc/liquidsoap/spotify.liq; then
-    die "Liquidsoap config check failed. Fix /etc/liquidsoap/spotify.liq then re-run."
-  fi
-
   systemctl daemon-reload
-  systemctl enable --now liquidsoap-spotify
-  systemctl restart liquidsoap-spotify
-  systemctl is-active --quiet liquidsoap-spotify || {
-    systemctl status liquidsoap-spotify --no-pager -l || true
-    journalctl -u liquidsoap-spotify -n 200 --no-pager -l || true
-    die "liquidsoap-spotify not active"
-  }
-  ok "liquidsoap-spotify active"
+  systemctl enable --now spotify-roon-liquidsoap.service
 }
 
-# ---------- ALSA loopback
-ensure_alsa_loopback() {
-  sec "ALSA loopback (snd-aloop)"
-  modprobe snd-aloop 2>/dev/null || true
-  echo "snd-aloop" >/etc/modules-load.d/snd-aloop.conf
-  ok "snd-aloop load requested (best effort)"
+write_public_conf() {
+  install -d -m 0755 /etc/spotify-roon-bridge
+  cat >/etc/spotify-roon-bridge/bridge.conf <<EOF
+SERVICE_USER=${SERVICE_USER}
+ICECAST_HOST=${ICECAST_HOST}
+ICECAST_PORT=${ICECAST_PORT}
+MOUNT_MP3=${MOUNT_MP3}
+MOUNT_AAC=${MOUNT_AAC}
+MOUNT_FLAC=${MOUNT_FLAC}
+ALSA_CAPTURE_DEVICE=${ALSA_CAPTURE_DEVICE}
+SINK_NAME=${SINK_NAME}
+PULSE_TARGET_SINK=${PULSE_TARGET_SINK}
+LOG_GROUP=${LOG_GROUP}
+LOG_DIR=${LOG_DIR}
+LOG_FILE=${LOG_FILE}
+EOF
+  chmod 0644 /etc/spotify-roon-bridge/bridge.conf
 }
 
-smoke_tests() {
-  sec "Smoke tests"
-
-  local st
-  st="$(http_code_get "http://127.0.0.1:${ICECAST_PORT}/status.xsl")"
-  [[ "$st" == "200" ]] || die "Icecast status page not reachable (HTTP $st)"
-  ok "Icecast status OK (HTTP 200)"
-
-  local mounts
-  mounts="$(curl -fsS "http://127.0.0.1:${ICECAST_PORT}/admin/listmounts" \
-            -u "${ICECAST_ADMIN_USER}:${ICECAST_ADMIN_PW}" || true)"
-
-  for m in "${ICECAST_MOUNT_MP3}" "${ICECAST_MOUNT_AAC}" "${ICECAST_MOUNT_LOSSLESS_OGG}" "${ICECAST_MOUNT_RAW_FLAC}"; do
-    echo "$mounts" | grep -q "mount=\"${m}\"" || {
-      journalctl -u liquidsoap-spotify -n 200 --no-pager -l || true
-      die "Mount not visible: ${m}"
-    }
-    ok "Mount visible: ${m}"
-  done
-
-  local mp3 aac ogg flac
-  mp3="$(http_code_get "http://127.0.0.1:${ICECAST_PORT}${ICECAST_MOUNT_MP3}")"
-  aac="$(http_code_get "http://127.0.0.1:${ICECAST_PORT}${ICECAST_MOUNT_AAC}")"
-  ogg="$(http_code_get "http://127.0.0.1:${ICECAST_PORT}${ICECAST_MOUNT_LOSSLESS_OGG}")"
-  flac="$(http_code_get "http://127.0.0.1:${ICECAST_PORT}${ICECAST_MOUNT_RAW_FLAC}")"
-  echo "MP3 HTTP=${mp3}  AAC HTTP=${aac}  OGG/FLAC HTTP=${ogg}  RAW FLAC HTTP=${flac}"
-
-  ok "Smoke tests done"
-}
-
+########################################
+# Main
+########################################
 main() {
   require_root
-
-  read_secret_if_empty ICECAST_SOURCE_PW "Icecast SOURCE password"
-  read_secret_if_empty ICECAST_ADMIN_PW  "Icecast ADMIN  password"
-
-  sec "Install packages"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl perl python3 \
-    alsa-utils \
-    icecast2 \
-    liquidsoap \
-    avahi-daemon
-  ok "Packages installed"
-
-  ensure_user
-  ensure_alsa_loopback
-
-  patch_icecast_xml_debian_style
-  enable_icecast_debian
-
-  install_spotifyd
-  configure_spotifyd_conf
-  install_spotifyd_system_service
-
+  install_packages
+  ensure_groups_and_perms
+  enable_snd_aloop
+  configure_icecast
+  install_pulse_bridge
   configure_liquidsoap
-  install_liquidsoap_service
+  install_system_unit_liquidsoap
+  write_public_conf
 
-  smoke_tests
-
-  sec "DONE"
-  local ip
-  ip="$(hostname -I | awk '{print $1}')"
-  echo "MP3:          http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_MP3}"
-  echo "AAC:          http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_AAC}"
-  echo "LOSSLESS:     http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_LOSSLESS_OGG}"
-  echo "RAW FLAC:     http://${ip}:${ICECAST_PORT}${ICECAST_MOUNT_RAW_FLAC}"
-  echo "Services:"
-  echo "  systemctl status spotifyd icecast2 liquidsoap-spotify --no-pager"
+  log "OK."
+  log "URLs:"
+  log "  MP3 : http://${ICECAST_HOST}:${ICECAST_PORT}${MOUNT_MP3}"
+  log "  AAC : http://${ICECAST_HOST}:${ICECAST_PORT}${MOUNT_AAC}"
+  log "  FLAC: http://${ICECAST_HOST}:${ICECAST_PORT}${MOUNT_FLAC}"
 }
 
 main "$@"
