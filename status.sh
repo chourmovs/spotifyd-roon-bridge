@@ -1,74 +1,101 @@
 #!/usr/bin/env bash
 set -euo pipefail
-IFS=$'\n\t'
+
+line() { printf '%*s\n' "${1:-80}" '' | tr ' ' '-'; }
+
+CFG="/etc/spotify-roon-bridge/bridge.env"
+if [[ -f "$CFG" ]]; then
+  # shellcheck disable=SC1090
+  source "$CFG" || true
+fi
 
 SERVICE_USER="${SERVICE_USER:-radio}"
 ICECAST_HOST="${ICECAST_HOST:-127.0.0.1}"
 ICECAST_PORT="${ICECAST_PORT:-8000}"
+ICECAST_MOUNT_OGG="${ICECAST_MOUNT_OGG:-/spotify.ogg}"
+ICECAST_MOUNT_FLAC="${ICECAST_MOUNT_FLAC:-/spotify-lossless.ogg}"
+ALSA_LOOPBACK_CAPTURE="${ALSA_LOOPBACK_CAPTURE:-hw:Loopback,1,0}"
+PULSE_TARGET_SINK="${PULSE_TARGET_SINK:-}"
 
-sec()  { echo "== $* =="; }
-line() { echo "--------------------------------------------------------------------------------"; }
+echo "== Context =="
+echo "Date:          $(date --iso-8601=seconds)"
+echo "Host:          $(hostname)"
+echo "Kernel:        $(uname -a)"
+echo "Service user:  ${SERVICE_USER}"
+echo "Icecast OGG:   http://${ICECAST_HOST}:${ICECAST_PORT}${ICECAST_MOUNT_OGG}"
+echo "Icecast FLAC:  http://${ICECAST_HOST}:${ICECAST_PORT}${ICECAST_MOUNT_FLAC}"
+echo "ALSA capture:  ${ALSA_LOOPBACK_CAPTURE}"
+echo "PULSE_TARGET_SINK: ${PULSE_TARGET_SINK:-<auto>}"
+line
 
-run_as_user() {
-  local u="$1"; shift
-  local uid
-  uid="$(id -u "$u" 2>/dev/null || true)"
-  [[ -n "$uid" ]] || return 1
-  runuser -u "$u" -- bash -lc "
-    export XDG_RUNTIME_DIR=/run/user/$uid
-    export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus
-    $*
-  "
-}
+echo "== Core services (system) =="
+for s in icecast2 spotify-roon-liquidsoap; do
+  st="$(systemctl is-active "${s}.service" 2>/dev/null || true)"
+  en="$(systemctl is-enabled "${s}.service" 2>/dev/null || true)"
+  pid="$(systemctl show -p MainPID --value "${s}.service" 2>/dev/null || true)"
+  printf "%-30s active=%-10s enabled=%-10s pid=%s\n" "${s}.service" "${st:-unknown}" "${en:-unknown}" "${pid:-?}"
+done
+line
 
-main() {
-  if [[ -f /etc/spotify-roon-bridge/bridge.conf ]]; then
-    # shellcheck disable=SC1091
-    source /etc/spotify-roon-bridge/bridge.conf
-  fi
+echo "== Icecast Debian enable flag =="
+if [[ -f /etc/default/icecast2 ]]; then
+  grep -E '^ENABLE=' /etc/default/icecast2 || true
+else
+  echo "/etc/default/icecast2 absent"
+fi
+line
 
-  local pulse_source
-  pulse_source="${SINK_NAME:-loopback}.monitor"
-
-  sec "Context"
-  echo "Date:          $(date --iso-8601=seconds)"
-  echo "Host:          $(hostname)"
-  echo "Kernel:        $(uname -a)"
-  echo "Service user:  ${SERVICE_USER}"
-  echo "Icecast MP3:   http://${ICECAST_HOST}:${ICECAST_PORT}${MOUNT_MP3:-/spotify.mp3}"
-  echo "Icecast AAC:   http://${ICECAST_HOST}:${ICECAST_PORT}${MOUNT_AAC:-/spotify.aac}"
-  echo "Icecast FLAC:  http://${ICECAST_HOST}:${ICECAST_PORT}${MOUNT_FLAC:-/spotify.flac}"
-  echo "Pulse sink:    ${SINK_NAME:-loopback}"
-  echo "Pulse source:  ${pulse_source}"
-  echo "ALSA capture:  ${ALSA_CAPTURE_DEVICE:-hw:Loopback,1,0}"
-  line
-
-  sec "Services"
-  systemctl --no-pager -l status icecast2.service | sed -n '1,12p' || true
-  echo
-  systemctl --no-pager -l status spotify-roon-liquidsoap.service | sed -n '1,14p' || true
-  line
-
-  sec "Icecast"
-  if curl -fsS "http://${ICECAST_HOST}:${ICECAST_PORT}/status.xsl" >/dev/null 2>&1; then
-    echo "status.xsl: OK"
+echo "== Icecast port + HTTP checks =="
+if command -v ss >/dev/null 2>&1; then
+  if ss -ltn "( sport = :${ICECAST_PORT} )" | grep -q ":${ICECAST_PORT}"; then
+    echo "Port ${ICECAST_PORT}: LISTEN"
   else
-    echo "status.xsl: FAIL"
+    echo "Port ${ICECAST_PORT}: NOT LISTENING"
   fi
-  line
+fi
 
-  sec "Pulse (user)"
-  if id "${SERVICE_USER}" >/dev/null 2>&1; then
-    run_as_user "${SERVICE_USER}" "pactl info | egrep 'Server Name|Server Version|Default Sink|Default Source' || true" || true
+if command -v curl >/dev/null 2>&1; then
+  echo "HTTP / :"
+  curl -sSI "http://${ICECAST_HOST}:${ICECAST_PORT}/" | head -n 5 | sed 's/^/  /' || true
+  echo "HTTP mount OGG :"
+  curl -sSI "http://${ICECAST_HOST}:${ICECAST_PORT}${ICECAST_MOUNT_OGG}" | head -n 5 | sed 's/^/  /' || true
+  echo "HTTP mount FLAC :"
+  curl -sSI "http://${ICECAST_HOST}:${ICECAST_PORT}${ICECAST_MOUNT_FLAC}" | head -n 5 | sed 's/^/  /' || true
+fi
+line
+
+echo "== Pulse bridge (user) =="
+if id "${SERVICE_USER}" >/dev/null 2>&1; then
+  uid="$(id -u "${SERVICE_USER}")"
+  xdg="/run/user/${uid}"
+  bus="unix:path=${xdg}/bus"
+
+  if [[ -S "${xdg}/bus" ]]; then
+    st="$(sudo -u "${SERVICE_USER}" XDG_RUNTIME_DIR="$xdg" DBUS_SESSION_BUS_ADDRESS="$bus" \
+      systemctl --user is-active spotify-roon-pulse-bridge.service 2>/dev/null || true)"
+    echo "spotify-roon-pulse-bridge.service: ${st:-unknown}"
     echo
-    run_as_user "${SERVICE_USER}" "pactl list short sinks || true" || true
-    echo
-    run_as_user "${SERVICE_USER}" "pactl list short sink-inputs || true" || true
+    sudo -u "${SERVICE_USER}" XDG_RUNTIME_DIR="$xdg" DBUS_SESSION_BUS_ADDRESS="$bus" \
+      /usr/local/bin/spotify-roon-pulse-bridge status || true
+  else
+    echo "systemd user bus absent (${xdg}/bus)"
   fi
-  line
+else
+  echo "User ${SERVICE_USER} absent."
+fi
+line
 
-  sec "Logs (last 30)"
-  journalctl -u spotify-roon-liquidsoap.service -n 30 --no-pager -l || true
-}
+echo "== Liquidsoap file log (tail) =="
+if [[ -f /var/log/spotify-roon-bridge/liquidsoap.log ]]; then
+  tail -n 80 /var/log/spotify-roon-bridge/liquidsoap.log | sed 's/^/  /' || true
+else
+  echo "  /var/log/spotify-roon-bridge/liquidsoap.log absent"
+fi
+line
 
-main "$@"
+echo "== Journald (diagnostic) =="
+echo "-- spotify-roon-liquidsoap (last 80) --"
+journalctl -u spotify-roon-liquidsoap.service -n 80 --no-pager -l 2>/dev/null | sed 's/^/  /' || true
+echo
+echo "-- icecast2 (last 80) --"
+journalctl -u icecast2.service -n 80 --no-pager -l 2>/dev/null | sed 's/^/  /' || true
